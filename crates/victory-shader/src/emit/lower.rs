@@ -435,7 +435,6 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        let fence_only_barrier = divergent_barriers(p, x.st, &no_barrier);
         Lower {
             s,
             x,
@@ -475,7 +474,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             flat: None,
             no_barrier,
-            fence_only_barrier,
+            fence_only_barrier: HashSet::new(),
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -836,6 +835,11 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        // Whole-wave simulation can replace definitions or skip instructions.
+        let proof_order =
+            (self.s.threads.is_some() && self.sections.is_empty() && self.bad.is_empty())
+                .then_some(order.as_slice());
+        self.fence_only_barrier = divergent_barriers(p, self.x.st, &self.no_barrier, proof_order);
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -6631,16 +6635,11 @@ fn divergent_barriers(
     p: &crate::ir::Program,
     st: &crate::structure::Structured,
     skip: &HashSet<usize>,
+    proof_order: Option<&[usize]>,
 ) -> HashSet<usize> {
     let n = p.blocks.len();
     let barriers: Vec<usize> = (0..n)
-        .filter(|b| {
-            !skip.contains(b)
-                && p.blocks[*b]
-                    .insts
-                    .iter()
-                    .any(|i| i.name() == "s_barrier")
-        })
+        .filter(|b| !skip.contains(b) && p.blocks[*b].insts.iter().any(|i| i.name() == "s_barrier"))
         .collect();
     if barriers.is_empty() {
         return HashSet::new();
@@ -6704,7 +6703,122 @@ fn divergent_barriers(
             out.insert(b);
         }
     }
+    if !out.is_empty()
+        && let Some(order) = proof_order
+        && let Some(edges) = barrier_proof_edges(p, st, order)
+    {
+        let mut required = vec![false; n];
+        out.retain(|&barrier| {
+            // In a DAG a block can execute at most once. Working backward,
+            // it is required at a block if every outgoing edge requires it.
+            for &b in order.iter().rev() {
+                required[b] =
+                    b == barrier || edges[b].is_some_and(|(t, f)| required[t] && required[f]);
+            }
+            !required[0]
+        });
+    }
     out
+}
+
+/// Overapproximate the emitted paths, pruning only branches on proven SCC
+/// constants. Reject raw backedges too: lowering can add a loop-limit exit.
+fn barrier_proof_edges(
+    p: &Program,
+    st: &Structured,
+    order: &[usize],
+) -> Option<Vec<Option<(usize, usize)>>> {
+    let mut visited = vec![false; p.blocks.len()];
+    let mut edges = vec![None; p.blocks.len()];
+    let mut constants = HashMap::new();
+    for &b in order {
+        visited[b] = true;
+        let block = &p.blocks[b];
+        if matches!(block.exit, Exit::Indirect)
+            || block.exit.successors().iter().any(|&t| visited[t])
+        {
+            return None;
+        }
+        for phi in &block.phis {
+            if matches!(phi.reg, Reg::S(0..=105))
+                && let Some(&first) = phi.args.first().and_then(|v| constants.get(v))
+                && phi.args.iter().all(|v| constants.get(v) == Some(&first))
+            {
+                constants.insert(phi.value, first);
+            }
+        }
+        for inst in &block.insts {
+            if let Fields::Sop { dst, src, .. } = &inst.fields {
+                let operand = |op| match op {
+                    Operand::Literal(word) => Some(word),
+                    Operand::Const(code @ 128..=208) => crate::resource::inline(code),
+                    Operand::Scalar {
+                        code: code @ 0..=105,
+                        ..
+                    } => constants.get(&inst.read(Reg::S(code))?).copied(),
+                    _ => None,
+                };
+                let known = match (inst.name(), dst, src.as_slice()) {
+                    (
+                        "s_mov_b32",
+                        Some(Operand::Scalar {
+                            code: code @ 0..=105,
+                            ..
+                        }),
+                        &[src],
+                    ) if !inst
+                        .write(Reg::S(*code))
+                        .is_some_and(|v| st.masks.contains_key(&v)) =>
+                    {
+                        inst.write(Reg::S(*code)).zip(operand(src))
+                    }
+                    ("s_cmp_eq_u32", None, &[a, b]) => inst
+                        .write(Reg::Scc)
+                        .zip(operand(a).zip(operand(b)).map(|(a, b)| u32::from(a == b))),
+                    _ => None,
+                };
+                if let Some((v, word)) = known {
+                    constants.insert(v, word);
+                }
+            }
+        }
+        edges[b] = match st.exits[b] {
+            LaneExit::End => None,
+            LaneExit::Indirect => return None,
+            LaneExit::Jump(t) => Some((t, t)),
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } => match st.bools.node(when) {
+                Some((Atom::Uniform(v), lo, hi))
+                    if matches!(
+                        (lo, hi),
+                        (Bool::FALSE, Bool::TRUE) | (Bool::TRUE, Bool::FALSE)
+                    ) =>
+                {
+                    if let Some(&scc) = constants.get(&v) {
+                        let value = if scc == 0 { lo } else { hi };
+                        let target = if value == Bool::TRUE {
+                            taken
+                        } else {
+                            not_taken
+                        };
+                        Some((target, target))
+                    } else {
+                        Some((taken, not_taken))
+                    }
+                }
+                _ => Some((taken, not_taken)),
+            },
+        };
+        if let Some((t, f)) = edges[b]
+            && (visited[t] || visited[f])
+        {
+            return None;
+        }
+    }
+    Some(edges)
 }
 
 #[cfg(test)]
@@ -6714,6 +6828,169 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+    const S_BARRIER: u32 = 0xBF8A_0000;
+
+    fn classify_barriers(
+        p: &ir::Program,
+        st: &structure::Structured,
+    ) -> std::collections::HashSet<usize> {
+        let order = ir::reverse_postorder(&p.blocks);
+        super::divergent_barriers(p, st, &Default::default(), Some(&order))
+    }
+
+    #[test]
+    fn divergent_barriers_after_reconvergence_with_unknown_sgpr_bypass() {
+        let words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0001, // s_cbranch_execz -> 16
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x887E_007E, // 16: s_or_b32 exec_lo, exec_lo, s0
+            0xBF06_0302, // s_cmp_eq_u32 s2, s3
+            0xBF85_0001, // s_cbranch_scc1 -> 32
+            S_BARRIER,
+            S_ENDPGM, // 32
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let classified = classify_barriers(&p, &st);
+        // Entry SGPRs can vary between waves or be unbound.
+        assert_eq!(classified, [3].into());
+    }
+
+    #[test]
+    fn divergent_barriers_in_one_arm_before_reconvergence() {
+        let words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0001, // s_cbranch_execz -> 16
+            S_BARRIER,
+            0x887E_007E, // 16: s_or_b32 exec_lo, exec_lo, s0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let classified = classify_barriers(&p, &st);
+        assert_eq!(classified, [1].into());
+    }
+
+    #[test]
+    fn divergent_barriers_with_early_exit() {
+        let words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0002, // s_cbranch_execz -> 20
+            S_BARRIER,
+            S_ENDPGM,
+            S_ENDPGM, // 20
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let classified = classify_barriers(&p, &st);
+        assert_eq!(classified, [1].into());
+    }
+
+    #[test]
+    fn divergent_barriers_after_reconvergence_with_lane_dependent_scc() {
+        let words = [
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0001, // s_cbranch_execz -> 20
+            0xBE82_0381, // s_mov_b32 s2, 1
+            0x887E_007E, // 20: s_or_b32 exec_lo, exec_lo, s0
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> 36
+            S_BARRIER,
+            S_ENDPGM, // 36
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let classified = classify_barriers(&p, &st);
+        assert_eq!(classified, [3].into());
+    }
+
+    // Both incoming definitions store zero, through different SSA values.
+    const EQUAL_PHI: [u32; 6] = [
+        0xBE82_0380, // s_mov_b32 s2, 0
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+        0xBF88_0001, // s_cbranch_execz -> 20
+        0xBE82_0380, // s_mov_b32 s2, 0
+        0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
+    ];
+
+    fn classify_after_equal_phi(suffix: &[u32]) -> std::collections::HashSet<usize> {
+        let code: Vec<u8> = EQUAL_PHI
+            .iter()
+            .chain(suffix)
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        classify_barriers(&p, &st)
+    }
+
+    #[test]
+    fn divergent_barriers_equal_constant_phi_after_reconvergence() {
+        for (cmp, branch) in [
+            (0xBF06_8102, 0xBF85_0001), // s2 == 1, branch if true
+            (0xBF06_8002, 0xBF84_0001), // s2 == 0, branch if false
+        ] {
+            let classified = classify_after_equal_phi(&[cmp, branch, S_BARRIER, S_ENDPGM]);
+            assert!(classified.is_empty(), "branch {branch:#x}: {classified:?}");
+        }
+        let classified = classify_after_equal_phi(&[
+            0xBF06_8002, // s2 == 0
+            0xBF85_0001, // s_cbranch_scc1 -> 36
+            S_ENDPGM,
+            S_BARRIER,
+            S_ENDPGM,
+        ]);
+        assert!(classified.is_empty(), "taken edge: {classified:?}");
+        lowers(
+            &[
+                &EQUAL_PHI[..],
+                &[0xBF06_8102, 0xBF85_0001, S_BARRIER, S_ENDPGM],
+            ]
+            .concat(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn divergent_barriers_keep_fence_for_cycles_and_indirect_exits() {
+        for unsupported in [
+            0xBF82_FFFE, // 44: s_branch -> 40, forms a cycle
+            0xBE80_2008, // 44: s_setpc_b64 s[8:9], an indirect exit
+        ] {
+            let classified = classify_after_equal_phi(&[
+                0xBF06_8102, // 24: s_cmp_eq_u32 s2, 1
+                0xBF85_0002, // 28: s_cbranch_scc1 -> 40
+                S_BARRIER,
+                S_ENDPGM,
+                0xBF84_0001, // 40: s_cbranch_scc0 -> 48
+                unsupported,
+                S_ENDPGM,
+            ]);
+            assert_eq!(classified, [3].into(), "instruction {unsupported:#x}");
+        }
+    }
+
+    #[test]
+    fn divergent_barriers_keep_fence_for_mask_scc() {
+        let classified = classify_after_equal_phi(&[
+            0xBF06_807E, // s_cmp_eq_u32 exec_lo, 0
+            0xBF84_0001, // s_cbranch_scc0 -> 36
+            S_BARRIER,
+            S_ENDPGM,
+        ]);
+        assert_eq!(classified, [3].into());
+    }
 
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {

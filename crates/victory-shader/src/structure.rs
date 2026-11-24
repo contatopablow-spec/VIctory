@@ -1162,6 +1162,75 @@ mod tests {
     }
 
     #[test]
+    fn scc_branch_atom_does_not_distinguish_lane_selected_sgpr_phi() {
+        for arm_writes_sgpr in [false, true] {
+            let p = build(
+                &[
+                    0xBE82_0380, // s_mov_b32 s2, 0
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+                    0xBF88_0001, // s_cbranch_execz -> 20
+                    if arm_writes_sgpr {
+                        0xBE82_0381 // s_mov_b32 s2, 1
+                    } else {
+                        0x7E02_0280 // v_mov_b32 v1, 0
+                    },
+                    0x887E_007E, // 20: s_or_b32 exec_lo, exec_lo, s0
+                    0xBF06_8002, // s_cmp_eq_u32 s2, 0
+                    0xBF85_0001, // s_cbranch_scc1 -> 36
+                    0xBF8A_0000, // s_barrier
+                    S_ENDPGM,    // 36
+                ],
+                false,
+            );
+            let st = structure(&p).unwrap();
+            let cmp = p.blocks[0].insts[1].write(Reg::S(VCC)).unwrap();
+            let LaneExit::Branch {
+                when,
+                taken: 2,
+                not_taken: 1,
+            } = st.exits[0]
+            else {
+                panic!("expected a lane-dependent bypass")
+            };
+            assert_eq!(
+                st.bools.node(when),
+                Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
+            );
+
+            let join = &p.blocks[2];
+            assert_eq!(join.preds, [0, 1]);
+            let compare = &join.insts[1];
+            assert_eq!(compare.name(), "s_cmp_eq_u32");
+            let scc = compare.write(Reg::Scc).unwrap();
+            assert_eq!(join.insts[2].read(Reg::Scc), Some(scc));
+            let LaneExit::Branch {
+                when,
+                taken: 4,
+                not_taken: 3,
+            } = st.exits[2]
+            else {
+                panic!("expected an SCC branch around the barrier")
+            };
+            assert_eq!(st.bools.support(when), [Atom::Uniform(scc)]);
+            assert_eq!(p.blocks[3].insts[0].name(), "s_barrier");
+
+            let sgpr = Reg::S(2);
+            let entry_value = p.blocks[0].insts[0].write(sgpr).unwrap();
+            let phi = join.phis.iter().find(|phi| phi.reg == sgpr);
+            if arm_writes_sgpr {
+                let phi = phi.expect("the two paths define different s2 values");
+                let arm_value = p.blocks[1].insts[0].write(sgpr).unwrap();
+                assert_eq!(phi.args, [entry_value, arm_value]);
+                assert_eq!(compare.read(sgpr), Some(phi.value));
+            } else {
+                assert!(phi.is_none());
+                assert_eq!(compare.read(sgpr), Some(entry_value));
+            }
+        }
+    }
+
+    #[test]
     fn irreducible_loops_are_split() {
         let p = build(
             &[
