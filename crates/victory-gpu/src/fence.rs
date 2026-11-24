@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,13 @@ struct Fence {
     moved: Condvar,
     /// Queues holding work back until the value reaches theirs
     /// (`ID3D12CommandQueue::Wait`). Locked after `waiters`, never before.
-    queues: Mutex<Vec<(u64, Weak<Timeline>)>>,
+    queues: Mutex<Vec<QueueWait>>,
+}
+
+struct QueueWait {
+    value: u64,
+    queue: Weak<Timeline>,
+    satisfied: Weak<AtomicBool>,
 }
 
 impl Drop for Fence {
@@ -237,12 +243,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     S_OK
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
-    let fence = fence(this);
-    let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    fence.value.store(value, Ordering::Release);
-    let queues = wake(fence, waiters);
-    run_held(queues);
+    run_held(signal_deferred(fence(this), value));
     S_OK
+}
+
+fn signal_deferred(fence: &Fence, value: u64) -> Vec<Arc<Timeline>> {
+    let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    // Serialize the store and scan with queue wait registration.
+    let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
+    fence.value.store(value, Ordering::Release);
+    let (woken, _) = wake_locked(fence, &mut waiters, &mut queues);
+    fence.moved.notify_all();
+    woken
 }
 
 /// Wakes any events and queues on `fence` whose value has been reached;
@@ -252,7 +264,7 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
 fn wake_locked(
     fence: &Fence,
     waiters: &mut Vec<(u64, usize)>,
-    queues: &mut Vec<(u64, Weak<Timeline>)>,
+    queues: &mut Vec<QueueWait>,
 ) -> (Vec<Arc<Timeline>>, bool) {
     let value = fence.value.load(Ordering::Acquire);
     let mut moved = false;
@@ -265,14 +277,16 @@ fn wake_locked(
         !reached
     });
     let mut woken = Vec::new();
-    queues.retain(|(wanted, queue)| {
-        if *wanted <= value {
-            woken.extend(queue.upgrade());
-            moved = true;
-            false
-        } else {
-            queue.strong_count() > 0
+    queues.retain(|wait| {
+        if wait.value > value {
+            return wait.queue.strong_count() > 0 && wait.satisfied.strong_count() > 0;
         }
+        if let Some(satisfied) = wait.satisfied.upgrade() {
+            satisfied.store(true, Ordering::Release);
+            woken.extend(wait.queue.upgrade());
+            moved = true;
+        }
+        false
     });
     (woken, moved)
 }
@@ -320,28 +334,38 @@ impl Held {
         Held(object::Held::new(this))
     }
 
-    pub(crate) fn reached(&self, value: u64) -> bool {
-        fence(self.0.get()).value.load(Ordering::Acquire) >= value
-    }
-
     pub(crate) fn signal(&self, value: u64) {
         signal(self.0.get(), value);
     }
 
-    /// Whether the value is reached; if not, `queue` is woken once it is.
-    /// Checked under the lock a signal takes, so no signal is missed.
-    pub(crate) fn wait_on_gpu(&self, value: u64, queue: &Arc<Timeline>) -> bool {
+    /// Checks the front wait, registering it once if it must hold the queue.
+    pub(crate) fn wait_on_gpu(
+        &self,
+        value: u64,
+        queue: &Arc<Timeline>,
+        pending: &mut Option<Arc<AtomicBool>>,
+    ) -> bool {
         let fence = fence(self.0.get());
         let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
-        if fence.value.load(Ordering::Acquire) >= value {
+        if pending
+            .as_ref()
+            .is_some_and(|satisfied| satisfied.load(Ordering::Acquire))
+            || fence.value.load(Ordering::Acquire) >= value
+        {
+            *pending = None;
             return true;
         }
-        let queue = Arc::downgrade(queue);
-        if !queues.iter().any(|(v, q)| *v == value && q.ptr_eq(&queue)) {
-            queues.push((value, queue));
+        if pending.is_none() {
+            let satisfied = Arc::new(AtomicBool::new(false));
+            queues.push(QueueWait {
+                value,
+                queue: Arc::downgrade(queue),
+                satisfied: Arc::downgrade(&satisfied),
+            });
+            *pending = Some(satisfied);
+            drop(queues);
+            watch_notify();
         }
-        drop(queues);
-        watch_notify();
         false
     }
 }
@@ -572,6 +596,113 @@ mod tests {
         written(other.as_mut_ptr() as usize, 16).run();
         written(address(g) + 8, 8).run();
         release_fence(g);
+    }
+
+    // An already satisfied wait must survive a fence rewind before the
+    // deferred wake runs. New waits must still observe the lower value.
+    #[test]
+    fn queue_wait_survives_rewind_before_deferred_wake() {
+        use crate::timeline::{Op, Timeline};
+        let f = new_fence(0);
+        let queue = Arc::new(Timeline::default());
+        let ran = Arc::new(AtomicU64::new(0));
+        queue.submit(Op::Wait(Held::new(f), 1));
+        let seen = ran.clone();
+        queue.submit(Op::Run(Box::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        })));
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        // Precisely split the signal into its locked completion step and
+        // deferred work. This prevents the watcher consuming the wake.
+        let woken = {
+            let obj = fence(f);
+            let waiters = obj.waiters.lock().unwrap();
+            obj.value.store(1, Ordering::Release);
+            wake(obj, waiters)
+        };
+        assert_eq!(woken.len(), 1);
+        assert_eq!(signal(f, 0), S_OK);
+        run_held(woken);
+        let observed = ran.load(Ordering::SeqCst);
+        // Drain even on the buggy path before asserting.
+        assert_eq!(signal(f, 1), S_OK);
+        drop(queue);
+        release_fence(f);
+        assert_eq!(observed, 1, "satisfied wait was lost on rewind");
+    }
+
+    fn count_queue_run(queue: &Arc<Timeline>, count: &Arc<AtomicU64>) {
+        let count = count.clone();
+        queue.submit(crate::timeline::Op::Run(Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        })));
+    }
+
+    #[test]
+    fn queue_wait_submitted_after_rewind_observes_lower_value() {
+        use crate::timeline::Op;
+        let f = new_fence(0);
+        assert_eq!(signal(f, 1), S_OK);
+        assert_eq!(signal(f, 0), S_OK);
+        let queue = Arc::new(Timeline::default());
+        let count = Arc::new(AtomicU64::new(0));
+        queue.submit(Op::Wait(Held::new(f), 1));
+        count_queue_run(&queue, &count);
+        assert_eq!(completed(f), 0);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(signal(f, 1), S_OK);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        drop(queue);
+        release_fence(f);
+    }
+
+    #[test]
+    fn repeated_queue_wake_cannot_satisfy_the_next_wait_on_the_same_fence() {
+        use crate::timeline::Op;
+        let f = new_fence(0);
+        let queue = Arc::new(Timeline::default());
+        let count = Arc::new(AtomicU64::new(0));
+        queue.submit(Op::Wait(Held::new(f), 1));
+        count_queue_run(&queue, &count);
+        queue.submit(Op::Wait(Held::new(f), 1));
+        count_queue_run(&queue, &count);
+
+        let first = signal_deferred(fence(f), 1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(signal(f, 0), S_OK);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        // A submit advances through the first wait and registers the second
+        // before the first wake arrives.
+        count_queue_run(&queue, &count);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        run_held(first.clone());
+        run_held(first);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        let second = signal_deferred(fence(f), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(signal(f, 0), S_OK);
+        run_held(second.clone());
+        run_held(second);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        drop(queue);
+        release_fence(f);
+    }
+
+    #[test]
+    fn dropping_a_waiting_queue_discards_its_work() {
+        use crate::timeline::Op;
+        let f = new_fence(0);
+        let queue = Arc::new(Timeline::default());
+        let weak = Arc::downgrade(&queue);
+        let count = Arc::new(AtomicU64::new(0));
+        queue.submit(Op::Wait(Held::new(f), 1));
+        count_queue_run(&queue, &count);
+        drop(queue);
+        assert!(weak.upgrade().is_none());
+        assert!(signal_deferred(fence(f), 1).is_empty());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        release_fence(f);
     }
 
     /// A bottom-of-pipe write at a fence a held queue waits for does not
